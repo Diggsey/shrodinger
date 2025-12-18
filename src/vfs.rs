@@ -280,8 +280,8 @@ impl Vfs {
                 Ok(()) => break,
                 Err(VfsError::MetadataOverrun { extra_blocks }) => {
                     let relocations = self.metadata.steal_blocks(
-                        self.metadata.allocated_blocks
-                            ..(self.metadata.allocated_blocks + extra_blocks),
+                        self.metadata.metadata_blocks
+                            ..(self.metadata.metadata_blocks + extra_blocks),
                     );
                     self.metadata.metadata_blocks += extra_blocks;
                     for relocation in relocations {
@@ -350,7 +350,7 @@ impl Vfs {
         parent_id: FileId,
         name: &str,
         is_directory: bool,
-    ) -> Result<(), VfsError> {
+    ) -> Result<FileId, VfsError> {
         let file_id = self.metadata.allocate_file_id();
         let parent_item = self
             .metadata
@@ -373,7 +373,7 @@ impl Vfs {
             ),
         );
         self.save_metadata()?;
-        Ok(())
+        Ok(file_id)
     }
     pub fn delete(&mut self, file_id: FileId) -> Result<(), VfsError> {
         if file_id == FileId::ROOT {
@@ -1132,5 +1132,25 @@ mod tests {
 
         let stat = vfs.stat(file_id).unwrap();
         assert_eq!(stat.size(), 0);
+    }
+
+    #[test]
+    fn test_metadata_growth() {
+        let (_temp_file, mut vfs) = create_temp_vfs();
+
+        let file_id = vfs.create(FileId::ROOT, "file.txt", false).unwrap();
+        vfs.write(file_id, 0, b"Important data").unwrap();
+
+        // Force metadata to grow into space allocated to the important file
+        for i in 0..100 {
+            let temp_id = vfs
+                .create(FileId::ROOT, &format!("tempfile-{i}.txt"), false)
+                .unwrap();
+            vfs.write(temp_id, 0, b"Filler data").unwrap();
+        }
+
+        let mut buffer = [0u8; 14];
+        vfs.read(file_id, 0, &mut buffer).unwrap();
+        assert_eq!(&buffer, b"Important data");
     }
 }
