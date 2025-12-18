@@ -1,6 +1,5 @@
 use crate::fs::context::EncryptedContext;
-use std::fs::{self, OpenOptions};
-use std::{fs::File, io::ErrorKind};
+use std::fs::OpenOptions;
 
 use std::path::Path;
 use winfsp::host::{DebugMode, FileSystemHost, FileSystemParams, VolumeParams};
@@ -12,9 +11,10 @@ pub struct EncryptedFilesystem {
 }
 
 impl EncryptedFilesystem {
-    pub fn create(path: &Path, volume_prefix: &str) -> anyhow::Result<Self> {
+    pub fn create(path: &Path, volume_prefix: &str, password: &str) -> anyhow::Result<Self> {
         let backing_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -24,7 +24,8 @@ impl EncryptedFilesystem {
             .prefix(volume_prefix)
             .filesystem_name("encryptedfs");
 
-        let context = EncryptedContext::new_with_volume_params(backing_file, &mut volume_params)?;
+        let context =
+            EncryptedContext::new_with_volume_params(backing_file, password, &mut volume_params)?;
 
         volume_params.file_info_timeout(1000);
         Ok(EncryptedFilesystem {

@@ -1,9 +1,11 @@
-use std::{collections::HashMap, ops::Range};
+use std::collections::HashMap;
+use std::collections::btree_map::Entry;
+use std::{collections::BTreeMap, ops::Range};
 
-use anyhow::Error;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
 
-use crate::block::{BLOCK_DATA_SIZE, DecryptionError, EncryptedBlockDevice};
+use crate::block::{BLOCK_DATA_SIZE, BLOCK_SIZE, BlockDeviceError, EncryptedBlockDevice};
 use crate::range::{RangeSet, SortedRangeSet};
 
 pub struct Vfs {
@@ -11,12 +13,90 @@ pub struct Vfs {
     metadata: VfsMetadata,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileId(u64);
+
+impl FileId {
+    pub const ROOT: Self = FileId(0);
+
+    /// Get the raw file ID value
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+/// VFS error types
+#[derive(Error, Debug)]
+pub enum VfsError {
+    #[error("Path not found")]
+    NotFound,
+
+    #[error("File already exists")]
+    FileExists,
+
+    #[error("Directory not empty")]
+    DirectoryNotEmpty,
+
+    #[error("Cannot delete root directory")]
+    CannotDeleteRoot,
+
+    #[error("Read out of bounds")]
+    ReadOutOfBounds,
+
+    #[error("Metadata overrun by {extra_blocks} blocks")]
+    MetadataOverrun { extra_blocks: u64 },
+
+    #[error("Block device error: {0}")]
+    BlockDevice(#[from] BlockDeviceError),
+
+    #[error("BSON error: {0}")]
+    Bson(#[from] bson::error::Error),
+}
+
+// Custom serialization module for HashMap<FileId, ItemMetadata>
+mod items_serde {
+    use super::*;
+
+    pub fn serialize<S>(
+        items: &HashMap<FileId, ItemMetadata>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let vec: Vec<_> = items.iter().map(|(k, v)| (*k, v)).collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<FileId, ItemMetadata>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(FileId, ItemMetadata)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct VfsMetadata {
     metadata_blocks: u64,
     allocated_blocks: u64,
-    items: HashMap<String, ItemMetadata>,
+    #[serde(with = "items_serde")]
+    items: HashMap<FileId, ItemMetadata>,
+    last_file_id: FileId,
     free_ranges: SortedRangeSet,
+}
+
+impl Default for VfsMetadata {
+    fn default() -> Self {
+        VfsMetadata {
+            metadata_blocks: 0,
+            allocated_blocks: 0,
+            items: HashMap::from([(FileId::ROOT, ItemMetadata::new(None, ITEM_FLAG_DIRECTORY))]),
+            free_ranges: SortedRangeSet::default(),
+            last_file_id: FileId::ROOT,
+        }
+    }
 }
 
 struct RelocatedBlock {
@@ -25,6 +105,10 @@ struct RelocatedBlock {
 }
 
 impl VfsMetadata {
+    fn allocate_file_id(&mut self) -> FileId {
+        self.last_file_id.0 += 1;
+        self.last_file_id
+    }
     fn allocate(&mut self, count: u64) -> RangeSet {
         let (mut taken_ranges, remaining) = self.free_ranges.take(count);
         taken_ranges.add(self.allocated_blocks..(self.allocated_blocks + remaining));
@@ -42,7 +126,7 @@ impl VfsMetadata {
             None
         } else {
             let new_index = self.allocate(1).ranges[0].start;
-            for item in self.items.values_mut() {
+            for (_, item) in self.items.iter_mut() {
                 if item.blocks.replace(index, new_index) {
                     return Some(RelocatedBlock {
                         old_index: index,
@@ -63,32 +147,53 @@ impl VfsMetadata {
 
 const ITEM_FLAG_DIRECTORY: u32 = 0x1;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct ItemMetadata {
     flags: u32,
     size: u64,
+    parent_id: Option<FileId>,
+    // For files
     blocks: RangeSet,
+    // For directories
+    children: BTreeMap<String, FileId>,
+}
+
+impl ItemMetadata {
+    fn new(parent_id: Option<FileId>, flags: u32) -> Self {
+        Self {
+            flags,
+            size: 0,
+            blocks: RangeSet::default(),
+            children: BTreeMap::new(),
+            parent_id,
+        }
+    }
 }
 
 pub struct StatItem {
-    pub flags: u32,
-    pub size: u64,
+    file_id: FileId,
+    flags: u32,
+    size: u64,
+    allocation_size: u64,
 }
 
-#[derive(thiserror::Error, Debug)]
-#[error("Metadata overrun by {extra_blocks} blocks")]
-pub struct MetadataOverrunError {
-    pub extra_blocks: u64,
+impl StatItem {
+    pub fn file_id(&self) -> FileId {
+        self.file_id
+    }
+    pub fn is_directory(&self) -> bool {
+        self.flags & ITEM_FLAG_DIRECTORY != 0
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn allocation_size(&self) -> u64 {
+        self.allocation_size
+    }
 }
 
-#[derive(thiserror::Error, Debug)]
-#[error("Path not found")]
-pub struct NotFoundError;
-
-fn read_metadata(device: &mut EncryptedBlockDevice) -> Result<VfsMetadata, anyhow::Error> {
-    fn read_metadata_inner(
-        device: &mut EncryptedBlockDevice,
-    ) -> Result<VfsMetadata, anyhow::Error> {
+fn read_metadata(device: &mut EncryptedBlockDevice) -> Result<VfsMetadata, VfsError> {
+    fn read_metadata_inner(device: &mut EncryptedBlockDevice) -> Result<VfsMetadata, VfsError> {
         let mut buffer = device.read_block(0)?;
         let mut block_idx = 1;
         let size =
@@ -104,10 +209,7 @@ fn read_metadata(device: &mut EncryptedBlockDevice) -> Result<VfsMetadata, anyho
     read_metadata_inner(device).or_else(|_| Ok(VfsMetadata::default()))
 }
 
-fn write_metadata(
-    device: &mut EncryptedBlockDevice,
-    value: &VfsMetadata,
-) -> Result<(), anyhow::Error> {
+fn write_metadata(device: &mut EncryptedBlockDevice, value: &VfsMetadata) -> Result<(), VfsError> {
     let mut buffer = bson::serialize_to_vec(value)?;
     buffer.extend(u64::to_le_bytes(buffer.len() as u64));
     buffer.rotate_right(8);
@@ -115,19 +217,20 @@ fn write_metadata(
 
     let num_blocks = (buffer.len() / BLOCK_DATA_SIZE) as u64;
     if num_blocks > value.metadata_blocks {
-        return Err(MetadataOverrunError {
+        return Err(VfsError::MetadataOverrun {
             extra_blocks: num_blocks - value.metadata_blocks,
-        }
-        .into());
+        });
     }
+
+    dbg!("Metadata: {:?}", value);
 
     device.write(0, &buffer)?;
     Ok(())
 }
 
 impl Vfs {
-    pub fn new(mut device: EncryptedBlockDevice) -> Result<Self, Error> {
-        let mut metadata = read_metadata(&mut device)?;
+    pub fn new(mut device: EncryptedBlockDevice) -> Result<Self, VfsError> {
+        let metadata = read_metadata(&mut device)?;
 
         let mut vfs = Self { device, metadata };
 
@@ -138,97 +241,159 @@ impl Vfs {
 
         Ok(vfs)
     }
-    pub fn save_metadata(&mut self) -> Result<(), Error> {
-        while let Some(err) = write_metadata(&mut self.device, &self.metadata).map_or_else(
-            |e| e.downcast::<MetadataOverrunError>().map(Some),
-            |()| Ok(None),
-        )? {
-            let relocations = self.metadata.steal_blocks(
-                self.metadata.allocated_blocks..(self.metadata.allocated_blocks + err.extra_blocks),
-            );
-            self.metadata.metadata_blocks += err.extra_blocks;
-            for relocation in relocations {
-                let block_data = self.device.read_block(relocation.old_index)?;
-                self.device.write_block(relocation.new_index, block_data)?;
+    pub fn save_metadata(&mut self) -> Result<(), VfsError> {
+        loop {
+            match write_metadata(&mut self.device, &self.metadata) {
+                Ok(()) => break,
+                Err(VfsError::MetadataOverrun { extra_blocks }) => {
+                    let relocations = self.metadata.steal_blocks(
+                        self.metadata.allocated_blocks
+                            ..(self.metadata.allocated_blocks + extra_blocks),
+                    );
+                    self.metadata.metadata_blocks += extra_blocks;
+                    for relocation in relocations {
+                        let block_data = self.device.read_block(relocation.old_index)?;
+                        self.device.write_block(relocation.new_index, block_data)?;
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         self.device.flush()?;
         Ok(())
     }
-    pub fn list_dir(&self, path: &str) -> Result<Vec<String>, Error> {
-        let item = self.metadata.items.get(path).ok_or(NotFoundError)?;
-        if item.flags & ITEM_FLAG_DIRECTORY == 0 {
-            return Err(NotFoundError.into());
+    pub fn resolve(&self, path: &str) -> Result<FileId, VfsError> {
+        let mut file_id = FileId::ROOT;
+        for segment in path.split('\\').filter(|s| !s.is_empty() && *s != ".") {
+            let item = self
+                .metadata
+                .items
+                .get(&file_id)
+                .ok_or(VfsError::NotFound)?;
+            if item.flags & ITEM_FLAG_DIRECTORY == 0 {
+                return Err(VfsError::NotFound);
+            }
+            if segment == ".." {
+                file_id = item.parent_id.ok_or(VfsError::NotFound)?;
+                continue;
+            }
+            file_id = *item.children.get(segment).ok_or(VfsError::NotFound)?;
         }
-        let prefix = format!("{}\\", path);
-        Ok(self
+        Ok(file_id)
+    }
+    pub fn list(
+        &self,
+        file_id: FileId,
+    ) -> Result<impl Iterator<Item = (&str, StatItem)>, VfsError> {
+        let item = self
             .metadata
             .items
-            .keys()
-            .filter(|k| {
-                k.strip_prefix(&prefix)
-                    .is_some_and(|rest| !rest.contains('\\'))
-            })
-            .cloned()
-            .collect())
-    }
-    pub fn stat(&self, path: &str) -> Option<StatItem> {
-        self.metadata.items.get(path).map(|item| StatItem {
-            flags: item.flags,
-            size: item.size,
-        })
-    }
-    pub fn create(&mut self, path: &str, flags: u32) -> Result<(), Error> {
-        if self.metadata.items.contains_key(path) {
-            return Err(anyhow::anyhow!("Item already exists"));
+            .get(&file_id)
+            .ok_or(VfsError::NotFound)?;
+        if item.flags & ITEM_FLAG_DIRECTORY == 0 {
+            return Err(VfsError::NotFound);
         }
-        self.metadata.items.insert(
-            path.to_string(),
-            ItemMetadata {
-                flags,
-                size: 0,
-                blocks: RangeSet::default(),
-            },
-        );
+        Ok(item
+            .children
+            .iter()
+            .map(|(name, &file_id)| (name.as_str(), self.stat(file_id).expect("File to exist"))))
+    }
+    pub fn stat(&self, file_id: FileId) -> Result<StatItem, VfsError> {
+        self.metadata
+            .items
+            .get(&file_id)
+            .map(|item| StatItem {
+                file_id,
+                flags: item.flags,
+                size: item.size,
+                allocation_size: item.blocks.length() * BLOCK_SIZE,
+            })
+            .ok_or(VfsError::NotFound)
+    }
+    pub fn create(&mut self, parent_id: FileId, name: &str, flags: u32) -> Result<(), VfsError> {
+        let file_id = self.metadata.allocate_file_id();
+        let parent_item = self
+            .metadata
+            .items
+            .get_mut(&parent_id)
+            .ok_or(VfsError::NotFound)?;
+        match parent_item.children.entry(name.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(file_id);
+            }
+            Entry::Occupied(_) => {
+                return Err(VfsError::FileExists);
+            }
+        }
+        self.metadata
+            .items
+            .insert(file_id, ItemMetadata::new(Some(parent_id), flags));
         self.save_metadata()?;
         Ok(())
     }
-    pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        if self
+    pub fn delete(&mut self, file_id: FileId) -> Result<(), VfsError> {
+        if file_id == FileId::ROOT {
+            return Err(VfsError::CannotDeleteRoot);
+        }
+        let item = self
             .metadata
             .items
-            .get(path)
-            .is_some_and(|item| item.flags & ITEM_FLAG_DIRECTORY != 0)
-            && !self.list_dir(path)?.is_empty()
-        {
-            return Err(anyhow::anyhow!("Directory not empty"));
+            .get(&file_id)
+            .ok_or(VfsError::NotFound)?;
+        if item.flags & ITEM_FLAG_DIRECTORY != 0 && !item.children.is_empty() {
+            return Err(VfsError::DirectoryNotEmpty);
         }
 
-        let item = self.metadata.items.remove(path).ok_or(NotFoundError)?;
+        // Unlink from parent
+        let parent_id = item.parent_id.ok_or(VfsError::NotFound)?;
+        self.metadata
+            .items
+            .get_mut(&parent_id)
+            .ok_or(VfsError::NotFound)?
+            .children
+            .retain(|_, &mut id| id != file_id);
+
+        // Free blocks
+        let item = self
+            .metadata
+            .items
+            .remove(&file_id)
+            .ok_or(VfsError::NotFound)?;
         for block_range in item.blocks.ranges {
             self.metadata.free_ranges.add(block_range);
         }
         self.save_metadata()?;
         Ok(())
     }
-    pub fn read(&mut self, path: &str, mut offset: u64, buffer: &mut [u8]) -> Result<(), Error> {
-        let item = self.metadata.items.get(path).ok_or(NotFoundError)?;
-        if offset + (buffer.len() as u64) > item.size {
-            return Err(anyhow::anyhow!("Read out of bounds"));
+    pub fn read(
+        &mut self,
+        file_id: FileId,
+        mut offset: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, VfsError> {
+        let item = self
+            .metadata
+            .items
+            .get(&file_id)
+            .ok_or(VfsError::NotFound)?;
+        let mut read_size = buffer.len() as u64;
+        if offset > item.size {
+            return Err(VfsError::ReadOutOfBounds);
+        }
+        if offset + read_size > item.size {
+            read_size = item.size - offset;
         }
         let mut buffer_offset = 0;
         for range in &item.blocks.ranges {
             let range_start = range.start * BLOCK_DATA_SIZE as u64;
             let range_end = range.end * BLOCK_DATA_SIZE as u64;
             let range_len = range_end - range_start;
-            if buffer_offset as u64 >= buffer.len() as u64 {
+            if buffer_offset as u64 >= read_size {
                 break;
             }
             if offset < range_len {
-                let read_len = std::cmp::min(
-                    range_len - offset,
-                    buffer.len() as u64 - buffer_offset as u64,
-                ) as usize;
+                let read_len =
+                    std::cmp::min(range_len - offset, read_size - buffer_offset as u64) as usize;
                 self.device.read(
                     range_start + offset,
                     &mut buffer[buffer_offset..buffer_offset + read_len],
@@ -239,10 +404,14 @@ impl Vfs {
                 offset -= range_len;
             }
         }
-        Ok(())
+        Ok(read_size as usize)
     }
-    pub fn resize(&mut self, path: &str, new_size: u64) -> Result<(), Error> {
-        let item = self.metadata.items.get_mut(path).ok_or(NotFoundError)?;
+    pub fn resize(&mut self, file_id: FileId, new_size: u64) -> Result<(), VfsError> {
+        let item = self
+            .metadata
+            .items
+            .get_mut(&file_id)
+            .ok_or(VfsError::NotFound)?;
         let current_blocks = item.blocks.length();
         let required_blocks =
             new_size.next_multiple_of(BLOCK_DATA_SIZE as u64) / BLOCK_DATA_SIZE as u64;
@@ -250,7 +419,7 @@ impl Vfs {
             let additional_blocks = required_blocks - current_blocks;
             let new_ranges = self.metadata.allocate(additional_blocks);
 
-            let item = self.metadata.items.get_mut(path).expect("File exists");
+            let item = self.metadata.items.get_mut(&file_id).expect("File exists");
             for range in new_ranges.ranges {
                 for i in range.clone() {
                     self.device.write_block(i, vec![0; BLOCK_DATA_SIZE])?;
@@ -266,18 +435,22 @@ impl Vfs {
         }
 
         // Always update size, even if blocks didn't change
-        let item = self.metadata.items.get_mut(path).expect("File exists");
+        let item = self.metadata.items.get_mut(&file_id).expect("File exists");
         item.size = new_size;
 
         self.save_metadata()?;
         Ok(())
     }
-    pub fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let item = self.metadata.items.get(path).ok_or(NotFoundError)?;
+    pub fn write(&mut self, file_id: FileId, offset: u64, data: &[u8]) -> Result<(), VfsError> {
+        let item = self
+            .metadata
+            .items
+            .get(&file_id)
+            .ok_or(VfsError::NotFound)?;
         let required_size = offset + (data.len() as u64);
         if required_size > item.size {
-            self.resize(path, required_size)?;
-            return self.write(path, offset, data);
+            self.resize(file_id, required_size)?;
+            return self.write(file_id, offset, data);
         }
 
         let mut buffer_offset = 0;
@@ -337,44 +510,48 @@ mod tests {
     fn test_new_vfs() {
         let (_temp_file, vfs) = create_temp_vfs();
 
-        // VFS should be empty initially
-        assert!(vfs.stat("any_path").is_none());
+        // VFS should have root directory
+        let root_stat = vfs.stat(FileId::ROOT).unwrap();
+        assert!(root_stat.is_directory());
     }
 
     #[test]
     fn test_create_file() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        // Create a file
-        vfs.create("test.txt", 0).unwrap();
+        // Create a file in root
+        vfs.create(FileId::ROOT, "test.txt", 0).unwrap();
 
         // File should exist with size 0
-        let stat = vfs.stat("test.txt").unwrap();
-        assert_eq!(stat.flags, 0);
-        assert_eq!(stat.size, 0);
+        let file_id = vfs.resolve("\\test.txt").unwrap();
+        let stat = vfs.stat(file_id).unwrap();
+        assert!(!stat.is_directory());
+        assert_eq!(stat.size(), 0);
     }
 
     #[test]
     fn test_create_directory() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        // Create a directory
-        vfs.create("mydir", ITEM_FLAG_DIRECTORY).unwrap();
+        // Create a directory in root
+        vfs.create(FileId::ROOT, "mydir", ITEM_FLAG_DIRECTORY)
+            .unwrap();
 
         // Directory should exist
-        let stat = vfs.stat("mydir").unwrap();
-        assert_eq!(stat.flags, ITEM_FLAG_DIRECTORY);
-        assert_eq!(stat.size, 0);
+        let dir_id = vfs.resolve("\\mydir").unwrap();
+        let stat = vfs.stat(dir_id).unwrap();
+        assert!(stat.is_directory());
+        assert_eq!(stat.size(), 0);
     }
 
     #[test]
     fn test_create_duplicate() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("test.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "test.txt", 0).unwrap();
 
         // Creating duplicate should fail
-        let result = vfs.create("test.txt", 0);
+        let result = vfs.create(FileId::ROOT, "test.txt", 0);
         assert!(result.is_err());
     }
 
@@ -382,19 +559,20 @@ mod tests {
     fn test_write_and_read() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write data
         let data = b"Hello, VFS!";
-        vfs.write("file.txt", 0, data).unwrap();
+        vfs.write(file_id, 0, data).unwrap();
 
         // Verify size increased
-        let stat = vfs.stat("file.txt").unwrap();
-        assert_eq!(stat.size, data.len() as u64);
+        let stat = vfs.stat(file_id).unwrap();
+        assert_eq!(stat.size(), data.len() as u64);
 
         // Read back
         let mut buffer = vec![0u8; data.len()];
-        vfs.read("file.txt", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(&buffer, data);
     }
 
@@ -402,17 +580,18 @@ mod tests {
     fn test_write_at_offset() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write initial data
-        vfs.write("file.txt", 0, b"AAAA").unwrap();
+        vfs.write(file_id, 0, b"AAAA").unwrap();
 
         // Write at offset
-        vfs.write("file.txt", 2, b"BB").unwrap();
+        vfs.write(file_id, 2, b"BB").unwrap();
 
         // Read back
         let mut buffer = vec![0u8; 4];
-        vfs.read("file.txt", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(&buffer, b"AABB");
     }
 
@@ -420,17 +599,18 @@ mod tests {
     fn test_write_extends_file() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write beyond current size
-        vfs.write("file.txt", 10, b"DATA").unwrap();
+        vfs.write(file_id, 10, b"DATA").unwrap();
 
-        let stat = vfs.stat("file.txt").unwrap();
-        assert_eq!(stat.size, 14); // 10 + 4
+        let stat = vfs.stat(file_id).unwrap();
+        assert_eq!(stat.size(), 14); // 10 + 4
 
         // Read back (including zero-filled gap)
         let mut buffer = vec![0u8; 14];
-        vfs.read("file.txt", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(&buffer[0..10], &[0u8; 10]);
         assert_eq!(&buffer[10..14], b"DATA");
     }
@@ -439,18 +619,19 @@ mod tests {
     fn test_write_large_file() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("large.bin", 0).unwrap();
+        vfs.create(FileId::ROOT, "large.bin", 0).unwrap();
+        let file_id = vfs.resolve("\\large.bin").unwrap();
 
         // Write data larger than one block
         let data = vec![0x42; BLOCK_DATA_SIZE * 3];
-        vfs.write("large.bin", 0, &data).unwrap();
+        vfs.write(file_id, 0, &data).unwrap();
 
-        let stat = vfs.stat("large.bin").unwrap();
-        assert_eq!(stat.size, data.len() as u64);
+        let stat = vfs.stat(file_id).unwrap();
+        assert_eq!(stat.size(), data.len() as u64);
 
         // Read back
         let mut buffer = vec![0u8; data.len()];
-        vfs.read("large.bin", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(buffer, data);
     }
 
@@ -458,18 +639,19 @@ mod tests {
     fn test_resize_grow() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
-        vfs.write("file.txt", 0, b"Hi").unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
+        vfs.write(file_id, 0, b"Hi").unwrap();
 
         // Grow file
-        vfs.resize("file.txt", 100).unwrap();
+        vfs.resize(file_id, 100).unwrap();
 
-        let stat = vfs.stat("file.txt").unwrap();
-        assert_eq!(stat.size, 100);
+        let stat = vfs.stat(file_id).unwrap();
+        assert_eq!(stat.size(), 100);
 
         // Original data should still be there
         let mut buffer = vec![0u8; 2];
-        vfs.read("file.txt", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(&buffer, b"Hi");
     }
 
@@ -477,18 +659,19 @@ mod tests {
     fn test_resize_shrink() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
-        vfs.write("file.txt", 0, b"Hello, World!").unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
+        vfs.write(file_id, 0, b"Hello, World!").unwrap();
 
         // Shrink file
-        vfs.resize("file.txt", 5).unwrap();
+        vfs.resize(file_id, 5).unwrap();
 
-        let stat = vfs.stat("file.txt").unwrap();
-        assert_eq!(stat.size, 5);
+        let stat = vfs.stat(file_id).unwrap();
+        assert_eq!(stat.size(), 5);
 
         // Should only read 5 bytes
         let mut buffer = vec![0u8; 5];
-        vfs.read("file.txt", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(&buffer, b"Hello");
     }
 
@@ -496,14 +679,15 @@ mod tests {
     fn test_delete_file() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("temp.txt", 0).unwrap();
-        vfs.write("temp.txt", 0, b"data").unwrap();
+        vfs.create(FileId::ROOT, "temp.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\temp.txt").unwrap();
+        vfs.write(file_id, 0, b"data").unwrap();
 
         // Delete file
-        vfs.delete("temp.txt").unwrap();
+        vfs.delete(file_id).unwrap();
 
         // File should no longer exist
-        assert!(vfs.stat("temp.txt").is_none());
+        assert!(vfs.resolve("\\temp.txt").is_err());
     }
 
     #[test]
@@ -511,7 +695,7 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         // Deleting nonexistent file should fail
-        let result = vfs.delete("nonexistent.txt");
+        let result = vfs.delete(FileId(9999));
         assert!(result.is_err());
     }
 
@@ -519,22 +703,26 @@ mod tests {
     fn test_delete_empty_directory() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("emptydir", ITEM_FLAG_DIRECTORY).unwrap();
+        vfs.create(FileId::ROOT, "emptydir", ITEM_FLAG_DIRECTORY)
+            .unwrap();
+        let dir_id = vfs.resolve("\\emptydir").unwrap();
 
         // Should be able to delete empty directory
-        vfs.delete("emptydir").unwrap();
-        assert!(vfs.stat("emptydir").is_none());
+        vfs.delete(dir_id).unwrap();
+        assert!(vfs.resolve("\\emptydir").is_err());
     }
 
     #[test]
     fn test_delete_nonempty_directory() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("dir", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create("dir\\file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "dir", ITEM_FLAG_DIRECTORY)
+            .unwrap();
+        let dir_id = vfs.resolve("\\dir").unwrap();
+        vfs.create(dir_id, "file.txt", 0).unwrap();
 
         // Should not be able to delete non-empty directory
-        let result = vfs.delete("dir");
+        let result = vfs.delete(dir_id);
         assert!(result.is_err());
     }
 
@@ -542,50 +730,67 @@ mod tests {
     fn test_list_dir() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("root", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create("root\\file1.txt", 0).unwrap();
-        vfs.create("root\\file2.txt", 0).unwrap();
-        vfs.create("root\\subdir", ITEM_FLAG_DIRECTORY).unwrap();
+        vfs.create(FileId::ROOT, "root", ITEM_FLAG_DIRECTORY)
+            .unwrap();
+        let root_id = vfs.resolve("\\root").unwrap();
+        vfs.create(root_id, "file1.txt", 0).unwrap();
+        vfs.create(root_id, "file2.txt", 0).unwrap();
+        vfs.create(root_id, "subdir", ITEM_FLAG_DIRECTORY).unwrap();
 
-        let mut items = vfs.list_dir("root").unwrap();
+        let mut items: Vec<_> = vfs
+            .list(root_id)
+            .unwrap()
+            .map(|(name, _)| name.to_string())
+            .collect();
         items.sort();
 
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0], "root\\file1.txt");
-        assert_eq!(items[1], "root\\file2.txt");
-        assert_eq!(items[2], "root\\subdir");
+        assert_eq!(items[0], "file1.txt");
+        assert_eq!(items[1], "file2.txt");
+        assert_eq!(items[2], "subdir");
     }
 
     #[test]
     fn test_list_dir_nested() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("a", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create("a\\b", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create("a\\b\\file.txt", 0).unwrap();
-        vfs.create("a\\other.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "a", ITEM_FLAG_DIRECTORY).unwrap();
+        let a_id = vfs.resolve("\\a").unwrap();
+        vfs.create(a_id, "b", ITEM_FLAG_DIRECTORY).unwrap();
+        let b_id = vfs.resolve("\\a\\b").unwrap();
+        vfs.create(b_id, "file.txt", 0).unwrap();
+        vfs.create(a_id, "other.txt", 0).unwrap();
 
-        // List root directory "a"
-        let mut items = vfs.list_dir("a").unwrap();
+        // List directory "a"
+        let mut items: Vec<_> = vfs
+            .list(a_id)
+            .unwrap()
+            .map(|(name, _)| name.to_string())
+            .collect();
         items.sort();
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0], "a\\b");
-        assert_eq!(items[1], "a\\other.txt");
+        assert_eq!(items[0], "b");
+        assert_eq!(items[1], "other.txt");
 
         // List subdirectory "a\\b"
-        let items = vfs.list_dir("a\\b").unwrap();
+        let items: Vec<_> = vfs
+            .list(b_id)
+            .unwrap()
+            .map(|(name, _)| name.to_string())
+            .collect();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0], "a\\b\\file.txt");
+        assert_eq!(items[0], "file.txt");
     }
 
     #[test]
     fn test_list_dir_not_directory() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Listing a file should fail
-        let result = vfs.list_dir("file.txt");
+        let result = vfs.list(file_id);
         assert!(result.is_err());
     }
 
@@ -594,7 +799,7 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         let mut buffer = vec![0u8; 10];
-        let result = vfs.read("nonexistent.txt", 0, &mut buffer);
+        let result = vfs.read(FileId(9999), 0, &mut buffer);
         assert!(result.is_err());
     }
 
@@ -602,12 +807,13 @@ mod tests {
     fn test_read_out_of_bounds() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
-        vfs.write("file.txt", 0, b"Hello").unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
+        vfs.write(file_id, 0, b"Hello").unwrap();
 
         // Try to read beyond file size
         let mut buffer = vec![0u8; 10];
-        let result = vfs.read("file.txt", 0, &mut buffer);
+        let result = vfs.read(file_id, 0, &mut buffer);
         assert!(result.is_err());
     }
 
@@ -616,7 +822,7 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         // Writing to nonexistent file should fail
-        let result = vfs.write("nonexistent.txt", 0, b"data");
+        let result = vfs.write(FileId(9999), 0, b"data");
         assert!(result.is_err());
     }
 
@@ -624,7 +830,7 @@ mod tests {
     fn test_stat_nonexistent() {
         let (_temp_file, vfs) = create_temp_vfs();
 
-        assert!(vfs.stat("nonexistent.txt").is_none());
+        assert!(vfs.stat(FileId(9999)).is_err());
     }
 
     #[test]
@@ -632,22 +838,24 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         // Create multiple files with different data
+        let mut file_ids = Vec::new();
         for i in 0..5 {
             let filename = format!("file{}.txt", i);
-            vfs.create(&filename, 0).unwrap();
+            vfs.create(FileId::ROOT, &filename, 0).unwrap();
+            let file_id = vfs.resolve(&format!("\\{}", filename)).unwrap();
+            file_ids.push(file_id);
 
             let data = vec![i as u8; 100];
-            vfs.write(&filename, 0, &data).unwrap();
+            vfs.write(file_id, 0, &data).unwrap();
         }
 
         // Verify all files
-        for i in 0..5 {
-            let filename = format!("file{}.txt", i);
-            let stat = vfs.stat(&filename).unwrap();
-            assert_eq!(stat.size, 100);
+        for (i, &file_id) in file_ids.iter().enumerate() {
+            let stat = vfs.stat(file_id).unwrap();
+            assert_eq!(stat.size(), 100);
 
             let mut buffer = vec![0u8; 100];
-            vfs.read(&filename, 0, &mut buffer).unwrap();
+            vfs.read(file_id, 0, &mut buffer).unwrap();
             assert_eq!(buffer, vec![i as u8; 100]);
         }
     }
@@ -666,8 +874,9 @@ mod tests {
             let device = EncryptedBlockDevice::open(file, "persist").unwrap();
             let mut vfs = Vfs::new(device).unwrap();
 
-            vfs.create("persistent.txt", 0).unwrap();
-            vfs.write("persistent.txt", 0, b"Persistent data").unwrap();
+            vfs.create(FileId::ROOT, "persistent.txt", 0).unwrap();
+            let file_id = vfs.resolve("\\persistent.txt").unwrap();
+            vfs.write(file_id, 0, b"Persistent data").unwrap();
         }
 
         // Reopen and verify
@@ -676,11 +885,12 @@ mod tests {
             let device = EncryptedBlockDevice::open(file, "persist").unwrap();
             let mut vfs = Vfs::new(device).unwrap();
 
-            let stat = vfs.stat("persistent.txt").unwrap();
-            assert_eq!(stat.size, 15);
+            let file_id = vfs.resolve("\\persistent.txt").unwrap();
+            let stat = vfs.stat(file_id).unwrap();
+            assert_eq!(stat.size(), 15);
 
             let mut buffer = vec![0u8; 15];
-            vfs.read("persistent.txt", 0, &mut buffer).unwrap();
+            vfs.read(file_id, 0, &mut buffer).unwrap();
             assert_eq!(&buffer, b"Persistent data");
         }
     }
@@ -689,14 +899,15 @@ mod tests {
     fn test_overwrite_data() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
-        vfs.write("file.txt", 0, b"Original").unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
+        vfs.write(file_id, 0, b"Original").unwrap();
 
         // Overwrite with different data
-        vfs.write("file.txt", 0, b"Modified").unwrap();
+        vfs.write(file_id, 0, b"Modified").unwrap();
 
         let mut buffer = vec![0u8; 8];
-        vfs.read("file.txt", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(&buffer, b"Modified");
     }
 
@@ -704,12 +915,13 @@ mod tests {
     fn test_partial_read() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
-        vfs.write("file.txt", 0, b"0123456789").unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
+        vfs.write(file_id, 0, b"0123456789").unwrap();
 
         // Read from middle
         let mut buffer = vec![0u8; 3];
-        vfs.read("file.txt", 5, &mut buffer).unwrap();
+        vfs.read(file_id, 5, &mut buffer).unwrap();
         assert_eq!(&buffer, b"567");
     }
 
@@ -717,15 +929,16 @@ mod tests {
     fn test_fragmented_writes() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write data in fragments
-        vfs.write("file.txt", 0, b"AAA").unwrap();
-        vfs.write("file.txt", 3, b"BBB").unwrap();
-        vfs.write("file.txt", 6, b"CCC").unwrap();
+        vfs.write(file_id, 0, b"AAA").unwrap();
+        vfs.write(file_id, 3, b"BBB").unwrap();
+        vfs.write(file_id, 6, b"CCC").unwrap();
 
         let mut buffer = vec![0u8; 9];
-        vfs.read("file.txt", 0, &mut buffer).unwrap();
+        vfs.read(file_id, 0, &mut buffer).unwrap();
         assert_eq!(&buffer, b"AAABBBCCC");
     }
 
@@ -734,47 +947,60 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         // Create directory structure
-        vfs.create("root", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create("root\\subdir1", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create("root\\subdir2", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create("root\\subdir1\\file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "root", ITEM_FLAG_DIRECTORY)
+            .unwrap();
+        let root_id = vfs.resolve("\\root").unwrap();
+        vfs.create(root_id, "subdir1", ITEM_FLAG_DIRECTORY).unwrap();
+        vfs.create(root_id, "subdir2", ITEM_FLAG_DIRECTORY).unwrap();
+        let subdir1_id = vfs.resolve("\\root\\subdir1").unwrap();
+        vfs.create(subdir1_id, "file.txt", 0).unwrap();
 
         // Verify structure
-        let mut items = vfs.list_dir("root").unwrap();
+        let mut items: Vec<_> = vfs
+            .list(root_id)
+            .unwrap()
+            .map(|(name, _)| name.to_string())
+            .collect();
         items.sort();
         assert_eq!(items.len(), 2);
-        assert!(items.contains(&"root\\subdir1".to_string()));
-        assert!(items.contains(&"root\\subdir2".to_string()));
+        assert!(items.contains(&"subdir1".to_string()));
+        assert!(items.contains(&"subdir2".to_string()));
 
-        let items = vfs.list_dir("root\\subdir1").unwrap();
+        let items: Vec<_> = vfs
+            .list(subdir1_id)
+            .unwrap()
+            .map(|(name, _)| name.to_string())
+            .collect();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0], "root\\subdir1\\file.txt");
+        assert_eq!(items[0], "file.txt");
     }
 
     #[test]
     fn test_resize_to_zero() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
-        vfs.write("file.txt", 0, b"Some data").unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
+        vfs.write(file_id, 0, b"Some data").unwrap();
 
         // Resize to zero
-        vfs.resize("file.txt", 0).unwrap();
+        vfs.resize(file_id, 0).unwrap();
 
-        let stat = vfs.stat("file.txt").unwrap();
-        assert_eq!(stat.size, 0);
+        let stat = vfs.stat(file_id).unwrap();
+        assert_eq!(stat.size(), 0);
     }
 
     #[test]
     fn test_empty_write() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create("file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write empty data should succeed but not change size
-        vfs.write("file.txt", 0, b"").unwrap();
+        vfs.write(file_id, 0, b"").unwrap();
 
-        let stat = vfs.stat("file.txt").unwrap();
-        assert_eq!(stat.size, 0);
+        let stat = vfs.stat(file_id).unwrap();
+        assert_eq!(stat.size(), 0);
     }
 }

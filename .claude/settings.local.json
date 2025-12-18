@@ -3,7 +3,10 @@
     "allow": [
       "Bash(dir C:UsersdiggsProjectsshrodinger /b)",
       "Bash(cargo test:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo check:*)"
     ]
   }
 }

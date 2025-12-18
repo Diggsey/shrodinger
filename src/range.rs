@@ -1,5 +1,5 @@
-use std::ops::Range;
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct RangeSet {
@@ -7,10 +7,6 @@ pub struct RangeSet {
 }
 
 impl RangeSet {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn simplify(&mut self) {
         let mut i = 0;
         while i < self.ranges.len() {
@@ -94,10 +90,6 @@ pub struct SortedRangeSet {
 }
 
 impl SortedRangeSet {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn add(&mut self, range: Range<u64>) {
         if range.is_empty() {
             return;
@@ -121,7 +113,8 @@ impl SortedRangeSet {
                     new_end = std::cmp::max(new_end, r2.end);
                     j += 1;
                 }
-                self.ranges.splice(i..j, [new_start..new_end]);
+                self.ranges
+                    .splice(i..j, std::iter::once(new_start..new_end));
                 return;
             }
         }
@@ -176,14 +169,14 @@ mod tests {
 
     #[test]
     fn test_rangeset_new() {
-        let rs = RangeSet::new();
+        let rs = RangeSet::default();
         assert_eq!(rs.ranges.len(), 0);
         assert_eq!(rs.length(), 0);
     }
 
     #[test]
     fn test_rangeset_add_single_range() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         assert_eq!(rs.ranges.len(), 1);
         assert_eq!(rs.ranges[0], 5..10);
@@ -192,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_add_empty_range() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..5);
         assert_eq!(rs.ranges.len(), 0);
         assert_eq!(rs.length(), 0);
@@ -200,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_add_adjacent_ranges() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         rs.add(10..15);
         assert_eq!(rs.ranges.len(), 1);
@@ -210,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_add_overlapping_ranges() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         rs.add(8..12);
         // RangeSet doesn't merge overlapping ranges, only adjacent ones
@@ -220,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_add_multiple_ranges() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         rs.add(20..25);
         rs.add(15..18);
@@ -230,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_length() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         assert_eq!(rs.length(), 0);
 
         rs.add(5..10);
@@ -247,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_replace_single_element_range() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..6);
         assert!(rs.replace(5, 10));
         assert_eq!(rs.ranges.len(), 1);
@@ -256,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_replace_at_start() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         assert!(rs.replace(5, 20));
         assert_eq!(rs.ranges.len(), 2);
@@ -266,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_replace_at_end() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         assert!(rs.replace(9, 20));
         assert_eq!(rs.ranges.len(), 2);
@@ -276,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_replace_in_middle() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         assert!(rs.replace(7, 20));
         assert_eq!(rs.ranges.len(), 3);
@@ -287,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_replace_not_found() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         assert!(!rs.replace(15, 20));
         assert_eq!(rs.ranges.len(), 1);
@@ -296,14 +289,14 @@ mod tests {
 
     #[test]
     fn test_rangeset_shrink_empty() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         let removed = rs.shrink(5);
         assert_eq!(removed.len(), 0);
     }
 
     #[test]
     fn test_rangeset_shrink_partial_range() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         let removed = rs.shrink(3);
         assert_eq!(removed.len(), 1);
@@ -315,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_shrink_entire_range() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         let removed = rs.shrink(5);
         assert_eq!(removed.len(), 1);
@@ -326,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_shrink_multiple_ranges() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         rs.add(15..20);
         let removed = rs.shrink(8);
@@ -340,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_rangeset_shrink_more_than_available() {
-        let mut rs = RangeSet::new();
+        let mut rs = RangeSet::default();
         rs.add(5..10);
         let removed = rs.shrink(10);
         assert_eq!(removed.len(), 1);
@@ -350,13 +343,13 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_new() {
-        let srs = SortedRangeSet::new();
+        let srs = SortedRangeSet::default();
         assert_eq!(srs.ranges.len(), 0);
     }
 
     #[test]
     fn test_sortedrangeset_add_single_range() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         assert_eq!(srs.ranges.len(), 1);
         assert_eq!(srs.ranges[0], 5..10);
@@ -364,14 +357,14 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_add_empty_range() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..5);
         assert_eq!(srs.ranges.len(), 0);
     }
 
     #[test]
     fn test_sortedrangeset_add_sorted_ranges() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         srs.add(15..20);
         srs.add(25..30);
@@ -383,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_add_unsorted_ranges() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(15..20);
         srs.add(5..10);
         srs.add(25..30);
@@ -395,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_add_adjacent_ranges() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         srs.add(10..15);
         assert_eq!(srs.ranges.len(), 1);
@@ -404,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_add_overlapping_ranges() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         srs.add(8..15);
         assert_eq!(srs.ranges.len(), 1);
@@ -413,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_add_contained_range() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..20);
         srs.add(10..15);
         assert_eq!(srs.ranges.len(), 1);
@@ -422,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_add_containing_range() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(10..15);
         srs.add(5..20);
         assert_eq!(srs.ranges.len(), 1);
@@ -431,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_add_merging_multiple_ranges() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         srs.add(15..20);
         srs.add(25..30);
@@ -442,13 +435,13 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_remove_from_empty() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         assert!(!srs.remove(5));
     }
 
     #[test]
     fn test_sortedrangeset_remove_not_found() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         assert!(!srs.remove(15));
         assert_eq!(srs.ranges.len(), 1);
@@ -456,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_remove_single_element_range() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..6);
         assert!(srs.remove(5));
         assert_eq!(srs.ranges.len(), 0);
@@ -464,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_remove_at_start() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         assert!(srs.remove(5));
         assert_eq!(srs.ranges.len(), 1);
@@ -473,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_remove_at_end() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         assert!(srs.remove(9));
         assert_eq!(srs.ranges.len(), 1);
@@ -482,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_remove_in_middle() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         assert!(srs.remove(7));
         assert_eq!(srs.ranges.len(), 2);
@@ -492,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_take_from_empty() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         let (rs, remaining) = srs.take(5);
         assert_eq!(rs.ranges.len(), 0);
         assert_eq!(remaining, 5);
@@ -500,7 +493,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_take_partial_range() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         let (rs, remaining) = srs.take(3);
         assert_eq!(rs.ranges.len(), 1);
@@ -512,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_take_entire_range() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         let (rs, remaining) = srs.take(5);
         assert_eq!(rs.ranges.len(), 1);
@@ -523,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_take_multiple_ranges() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         srs.add(15..20);
         let (rs, remaining) = srs.take(8);
@@ -537,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_take_more_than_available() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         let (rs, remaining) = srs.take(10);
         assert_eq!(rs.ranges.len(), 1);
@@ -548,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_sortedrangeset_take_all_ranges() {
-        let mut srs = SortedRangeSet::new();
+        let mut srs = SortedRangeSet::default();
         srs.add(5..10);
         srs.add(15..20);
         srs.add(25..30);

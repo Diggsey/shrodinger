@@ -10,6 +10,7 @@ use aes_gcm::{
 };
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub struct EncryptedBlockDevice {
     backing_file: File,
@@ -19,43 +20,42 @@ pub struct EncryptedBlockDevice {
 }
 
 const FILE_PREFIX: &[u8] = b"SHRODINGER_V1\0";
-const BLOCK_SIZE: u64 = 4096;
+pub const BLOCK_SIZE: u64 = 4096;
 const CHECK_DATA: &[u8] = b"SHRODINGER_CHECK";
-const CIPHER_TAG: &str = "AES.GCM.V1";
 const NONCE_SIZE: usize = <<Aes256Gcm as AeadCore>::NonceSize as Unsigned>::USIZE;
 const TAG_SIZE: usize = <<Aes256Gcm as AeadCore>::TagSize as Unsigned>::USIZE;
 pub const BLOCK_DATA_SIZE: usize = (BLOCK_SIZE as usize) - NONCE_SIZE - TAG_SIZE;
 
-fn validate_file_prefix(file: &mut File) -> Result<(), anyhow::Error> {
+fn validate_file_prefix(file: &mut File) -> Result<(), BlockDeviceError> {
     let mut buffer = [0u8; FILE_PREFIX.len()];
     file.seek(std::io::SeekFrom::Start(0))?;
     file.read_exact(&mut buffer)?;
     if buffer != FILE_PREFIX {
-        return Err(anyhow::anyhow!("Invalid backing file format"));
+        return Err(BlockDeviceError::InvalidFileFormat);
     }
     Ok(())
 }
 
-fn read_u64(file: &mut File) -> Result<u64, anyhow::Error> {
+fn read_u64(file: &mut File) -> Result<u64, BlockDeviceError> {
     let mut buffer = [0u8; 8];
     file.read_exact(&mut buffer)?;
     Ok(u64::from_le_bytes(buffer))
 }
 
-fn write_u64(file: &mut File, value: u64) -> Result<(), anyhow::Error> {
+fn write_u64(file: &mut File, value: u64) -> Result<(), BlockDeviceError> {
     let buffer = value.to_le_bytes();
     file.write_all(&buffer)?;
     Ok(())
 }
 
-fn read_bson<T: serde::de::DeserializeOwned>(file: &mut File) -> Result<T, anyhow::Error> {
+fn read_bson<T: serde::de::DeserializeOwned>(file: &mut File) -> Result<T, BlockDeviceError> {
     let size = read_u64(file)? as usize;
     let mut buffer = vec![0u8; size];
     file.read_exact(&mut buffer)?;
-    Ok(bson::deserialize_from_slice(&mut buffer.as_slice())?)
+    Ok(bson::deserialize_from_slice(buffer.as_slice())?)
 }
 
-fn write_bson<T: serde::Serialize>(file: &mut File, value: &T) -> Result<(), anyhow::Error> {
+fn write_bson<T: serde::Serialize>(file: &mut File, value: &T) -> Result<(), BlockDeviceError> {
     let buffer = bson::serialize_to_vec(value)?;
     write_u64(file, buffer.len() as u64)?;
     file.write_all(&buffer)?;
@@ -73,27 +73,60 @@ struct SideMetadata {
     check: Vec<u8>,
 }
 
-#[derive(thiserror::Error, Debug)]
-#[error("Decryption failed")]
-pub struct DecryptionError;
+/// Block device error types
+#[derive(Error, Debug)]
+pub enum BlockDeviceError {
+    #[error("Invalid backing file format")]
+    InvalidFileFormat,
 
-fn decrypt_with_nonce(cipher: &Aes256Gcm, data: &mut impl Buffer) -> Result<(), anyhow::Error> {
+    #[error("Invalid password")]
+    InvalidPassword,
+
+    #[error("Data too short to contain nonce")]
+    DataTooShort,
+
+    #[error("Decryption failed")]
+    DecryptionFailed,
+
+    #[error("Encryption failed")]
+    EncryptionFailed,
+
+    #[error("Read beyond end of device")]
+    ReadBeyondEnd,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("BSON error: {0}")]
+    Bson(#[from] bson::error::Error),
+
+    #[error("Argon2 password hash error: {0}")]
+    Argon2PasswordHash(#[from] argon2::password_hash::Error),
+
+    #[error("Argon2 error: {0}")]
+    Argon2(#[from] argon2::Error),
+}
+
+fn decrypt_with_nonce(cipher: &Aes256Gcm, data: &mut impl Buffer) -> Result<(), BlockDeviceError> {
     let len = data.len();
     if len < NONCE_SIZE {
-        return Err(anyhow::anyhow!("Data too short to contain nonce"));
+        return Err(BlockDeviceError::DataTooShort);
     }
     let nonce = Nonce::clone_from_slice(&data.as_ref()[(len - NONCE_SIZE)..len]);
     data.truncate(len - NONCE_SIZE);
     cipher
         .decrypt_in_place(&nonce, &[], data)
-        .map_err(|_| DecryptionError)?;
+        .map_err(|_| BlockDeviceError::DecryptionFailed)?;
     Ok(())
 }
 
-fn encrypt_with_nonce(cipher: &Aes256Gcm, data: &mut impl Buffer) -> Result<(), anyhow::Error> {
+fn encrypt_with_nonce(cipher: &Aes256Gcm, data: &mut impl Buffer) -> Result<(), BlockDeviceError> {
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    cipher.encrypt_in_place(&nonce, &[], data)?;
-    data.extend_from_slice(&nonce)?;
+    cipher
+        .encrypt_in_place(&nonce, &[], data)
+        .map_err(|_| BlockDeviceError::EncryptionFailed)?;
+    data.extend_from_slice(&nonce)
+        .map_err(|_| BlockDeviceError::EncryptionFailed)?;
     Ok(())
 }
 
@@ -102,7 +135,7 @@ impl EncryptedBlockDevice {
         mut backing_file: File,
         mut password1: Option<&'a str>,
         mut password2: Option<&'a str>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), BlockDeviceError> {
         let file_size = backing_file.metadata()?.len();
         assert_eq!(file_size, 0);
 
@@ -137,7 +170,7 @@ impl EncryptedBlockDevice {
                     check: check_data,
                 })
             })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+            .collect::<Result<Vec<_>, BlockDeviceError>>()?;
 
         // Write metadata
         let metadata = Metadata {
@@ -152,7 +185,7 @@ impl EncryptedBlockDevice {
 
         Ok(())
     }
-    pub fn open(mut backing_file: File, password: &str) -> Result<Self, anyhow::Error> {
+    pub fn open(mut backing_file: File, password: &str) -> Result<Self, BlockDeviceError> {
         let file_size = backing_file.metadata()?.len();
         validate_file_prefix(&mut backing_file)?;
 
@@ -178,10 +211,10 @@ impl EncryptedBlockDevice {
             }
         }
 
-        Err(anyhow::anyhow!("Invalid password"))
+        Err(BlockDeviceError::InvalidPassword)
     }
 
-    pub fn read_block(&mut self, block_index: u64) -> Result<Vec<u8>, anyhow::Error> {
+    pub fn read_block(&mut self, block_index: u64) -> Result<Vec<u8>, BlockDeviceError> {
         let block_offset = self.offset + block_index * BLOCK_SIZE * 2;
         self.backing_file
             .seek(std::io::SeekFrom::Start(block_offset))?;
@@ -194,7 +227,7 @@ impl EncryptedBlockDevice {
         Ok(encrypted_block)
     }
 
-    fn append_random_block(&mut self) -> Result<(), anyhow::Error> {
+    fn append_random_block(&mut self) -> Result<(), BlockDeviceError> {
         self.backing_file.seek(std::io::SeekFrom::End(0))?;
         let mut data = [0u8; BLOCK_SIZE as usize];
         OsRng.fill_bytes(&mut data);
@@ -207,7 +240,7 @@ impl EncryptedBlockDevice {
         &mut self,
         block_index: u64,
         mut data: Vec<u8>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), BlockDeviceError> {
         assert_eq!(data.len(), BLOCK_DATA_SIZE);
 
         let real_block_index = block_index * 2;
@@ -223,7 +256,7 @@ impl EncryptedBlockDevice {
         Ok(())
     }
 
-    pub fn read(&mut self, position: u64, buf: &mut [u8]) -> Result<(), anyhow::Error> {
+    pub fn read(&mut self, position: u64, buf: &mut [u8]) -> Result<(), BlockDeviceError> {
         let mut total_read = 0;
         let mut current_position = position;
 
@@ -234,7 +267,7 @@ impl EncryptedBlockDevice {
             let real_block_index = block_index * 2;
 
             if real_block_index as i64 >= self.block_count {
-                return Err(anyhow::anyhow!("Read beyond end of device"));
+                return Err(BlockDeviceError::ReadBeyondEnd);
             }
 
             let data = self.read_block(block_index)?;
@@ -248,7 +281,7 @@ impl EncryptedBlockDevice {
         Ok(())
     }
 
-    pub fn write(&mut self, position: u64, data: &[u8]) -> Result<(), anyhow::Error> {
+    pub fn write(&mut self, position: u64, data: &[u8]) -> Result<(), BlockDeviceError> {
         let mut total_written = 0;
         let mut current_position = position;
 
@@ -265,7 +298,7 @@ impl EncryptedBlockDevice {
                 let real_block_index = block_index * 2;
                 let mut block_data = if (real_block_index as i64) < self.block_count {
                     self.read_block(block_index).or_else(|e| {
-                        if e.is::<DecryptionError>() {
+                        if matches!(e, BlockDeviceError::DecryptionFailed) {
                             Ok(vec![0; BLOCK_DATA_SIZE])
                         } else {
                             Err(e)
@@ -287,7 +320,7 @@ impl EncryptedBlockDevice {
         Ok(())
     }
 
-    pub fn flush(&mut self) -> Result<(), anyhow::Error> {
+    pub fn flush(&mut self) -> Result<(), BlockDeviceError> {
         self.backing_file.flush()?;
         Ok(())
     }
@@ -296,7 +329,6 @@ impl EncryptedBlockDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::NamedTempFile;
 
     fn create_temp_device(password: &str) -> (NamedTempFile, EncryptedBlockDevice) {
@@ -591,11 +623,11 @@ mod tests {
         let (_temp_file, mut device) = create_temp_device("test_password");
 
         // Test with different data patterns
-        let patterns = vec![
+        let patterns = [
             vec![0x00; 1000],                                        // All zeros
             vec![0xFF; 1000],                                        // All ones
             (0..1000).map(|i| (i % 256) as u8).collect::<Vec<u8>>(), // Sequential
-            vec![0xAA, 0x55].repeat(500),                            // Alternating pattern
+            [0xAA, 0x55].repeat(500),                                // Alternating pattern
         ];
 
         for (i, pattern) in patterns.iter().enumerate() {
