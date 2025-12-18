@@ -90,6 +90,10 @@ pub struct SortedRangeSet {
 }
 
 impl SortedRangeSet {
+    pub fn length(&self) -> u64 {
+        self.ranges.iter().map(|r| r.end - r.start).sum()
+    }
+
     pub fn add(&mut self, range: Range<u64>) {
         if range.is_empty() {
             return;

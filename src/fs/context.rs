@@ -4,44 +4,37 @@ use crate::vfs::{Vfs, VfsError};
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, instrument, trace};
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::PSECURITY_DESCRIPTOR;
+use windows::core::PCWSTR;
 
 use std::os::raw::c_void;
 use std::os::windows::fs::MetadataExt;
-use std::time::SystemTime;
 use windows::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE;
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 
-use winfsp::FspError;
 use winfsp::U16CStr;
 use winfsp::constants::FspCleanupFlags::FspCleanupDelete;
 use winfsp::filesystem::{
     DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, WideNameInfo,
 };
 use winfsp::host::VolumeParams;
+use winfsp::{FspError, U16CString};
 
 #[repr(C)]
 pub struct EncryptedContext {
     vfs: Arc<Mutex<Vfs>>,
-}
-
-/// Convert SystemTime to Windows FILETIME (100-nanosecond intervals since January 1, 1601)
-fn system_time_to_filetime(time: SystemTime) -> u64 {
-    const UNIX_EPOCH_TO_FILETIME_EPOCH: u64 = 116444736000000000; // 100-nanosecond intervals from 1601 to 1970
-
-    match time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => {
-            let intervals =
-                duration.as_secs() * 10_000_000 + u64::from(duration.subsec_nanos()) / 100;
-            UNIX_EPOCH_TO_FILETIME_EPOCH + intervals
-        }
-        Err(_) => 0, // Before Unix epoch
-    }
+    sd_bytes: Vec<u8>,
 }
 
 impl EncryptedContext {
     pub fn new(vfs: Vfs) -> Self {
         Self {
             vfs: Arc::new(Mutex::new(vfs)),
+            sd_bytes: sddl_to_self_relative_sd_bytes("O:SYG:SYD:(A;OICI;FA;;;WD)"),
         }
     }
 
@@ -75,9 +68,49 @@ impl EncryptedContext {
             .file_info_timeout(1000)
             .allow_open_in_kernel_mode(true)
             .supports_posix_unlink_rename(false)
-            .post_disposition_only_when_necessary(true);
+            .post_disposition_only_when_necessary(true)
+            .device_control(false);
 
         Ok(context)
+    }
+
+    fn compute_attributes(&self, stat: &crate::vfs::StatItem) -> u32 {
+        if stat.is_directory() {
+            FILE_ATTRIBUTE_DIRECTORY.0
+        } else {
+            FILE_ATTRIBUTE_NORMAL.0
+        }
+    }
+
+    fn write_file_info(&self, file_info: &mut FileInfo, stat: &crate::vfs::StatItem) {
+        file_info.file_size = stat.size();
+        file_info.allocation_size = stat.allocation_size();
+        file_info.file_attributes = self.compute_attributes(stat);
+        file_info.index_number = stat.file_id().as_u64();
+        file_info.creation_time = stat.creation_time();
+        file_info.last_write_time = stat.last_modified_time();
+        file_info.change_time = stat.last_modified_time();
+        file_info.last_access_time = stat.creation_time();
+    }
+
+    fn get_security_inner(
+        &self,
+        security_descriptor: Option<&mut [c_void]>,
+    ) -> winfsp::Result<u64> {
+        if let Some(sd_buffer) = security_descriptor {
+            let sd_buffer = unsafe {
+                std::slice::from_raw_parts_mut(sd_buffer.as_mut_ptr() as *mut u8, sd_buffer.len())
+            };
+            let sd_len = self.sd_bytes.len();
+            if sd_buffer.len() < sd_len {
+                return Err(windows::Win32::Foundation::STATUS_BUFFER_TOO_SMALL.into());
+            }
+            sd_buffer[..sd_len].copy_from_slice(&self.sd_bytes);
+            debug!("get_security: copied security descriptor");
+        }
+
+        // Return the size of security descriptor (0 means none)
+        Ok(self.sd_bytes.len() as u64)
     }
 }
 
@@ -179,14 +212,47 @@ impl Drop for EncryptedContext {
     }
 }
 
+fn split_parent(path: &str) -> (&str, &str) {
+    match path.rfind('\\') {
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        _ => ("", path), // Root directory is parent
+    }
+}
+
+fn sddl_to_self_relative_sd_bytes(sddl: &str) -> Vec<u8> {
+    let sddl_w = U16CString::from_str(sddl).expect("Failed to convert SDDL to wide string");
+
+    let mut sd_ptr = PSECURITY_DESCRIPTOR::default();
+    let mut sd_len: u32 = 0;
+
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_w.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd_ptr,
+            Some(&mut sd_len),
+        )
+        .expect("ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
+    };
+
+    let bytes =
+        unsafe { std::slice::from_raw_parts(sd_ptr.0 as *const u8, sd_len as usize) }.to_vec();
+
+    unsafe {
+        LocalFree(Some(HLOCAL(sd_ptr.0)));
+    }
+
+    bytes
+}
+
 impl FileSystemContext for EncryptedContext {
     type FileContext = EncryptedFile;
 
-    #[instrument(skip(self, _security_descriptor, _resolve_reparse_points))]
+    #[instrument(skip(self, security_descriptor, _resolve_reparse_points))]
     fn get_security_by_name(
         &self,
         file_name: &U16CStr,
-        _security_descriptor: Option<&mut [c_void]>,
+        security_descriptor: Option<&mut [c_void]>,
         _resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let path = file_name.to_string_lossy();
@@ -196,22 +262,29 @@ impl FileSystemContext for EncryptedContext {
 
         // Check if file/directory exists
         let stat = vfs.stat(file_id)?;
-        let attributes = if stat.is_directory() {
-            FILE_ATTRIBUTE_DIRECTORY.0
-        } else {
-            FILE_ATTRIBUTE_NORMAL.0
-        };
-
+        let attributes = self.compute_attributes(&stat);
         debug!(
             "get_security_by_name: found path={}, is_dir={}",
             path,
             stat.is_directory()
         );
+
+        let sz_security_descriptor = self.get_security_inner(security_descriptor)?;
+
         Ok(FileSecurity {
             reparse: false,
-            sz_security_descriptor: 0,
+            sz_security_descriptor,
             attributes,
         })
+    }
+
+    /// Get file or directory security descriptor.
+    fn get_security(
+        &self,
+        _context: &Self::FileContext,
+        security_descriptor: Option<&mut [c_void]>,
+    ) -> winfsp::Result<u64> {
+        self.get_security_inner(security_descriptor)
     }
 
     #[instrument(skip(self, _security_descriptor))]
@@ -237,19 +310,13 @@ impl FileSystemContext for EncryptedContext {
         let mut vfs = self.vfs.lock().unwrap();
 
         // Split path into parent path and name
-        let (parent_path, name) = match path.rfind('\\') {
-            Some(pos) if pos > 0 => (&path[..pos], &path[pos + 1..]),
-            _ => ("\\", &path[1..]), // Root directory is parent
-        };
+        let (parent_path, name) = split_parent(&path);
 
         // Resolve parent directory
         let parent_id = vfs.resolve(parent_path)?;
 
-        // Determine if creating a directory
-        let flags = if is_directory { 0x1 } else { 0 };
-
         // Create the file or directory
-        vfs.create(parent_id, name, flags)?;
+        vfs.create(parent_id, name, is_directory)?;
 
         debug!("create: successfully created path={}", path);
 
@@ -258,32 +325,7 @@ impl FileSystemContext for EncryptedContext {
 
         // Get file info
         let stat = vfs.stat(file_id)?;
-
-        // Get current time for file timestamps
-        let now = system_time_to_filetime(SystemTime::now());
-
-        let fi = file_info.as_mut();
-        fi.file_attributes = if is_directory {
-            FILE_ATTRIBUTE_DIRECTORY.0
-        } else {
-            FILE_ATTRIBUTE_NORMAL.0
-        };
-        fi.file_size = stat.size();
-        fi.allocation_size = stat.allocation_size();
-        fi.creation_time = now;
-        fi.last_access_time = now;
-        fi.last_write_time = now;
-        fi.change_time = now;
-        fi.index_number = file_id.as_u64();
-
-        debug!(
-            "create: set file_info for path={}, size={}, file_id={:?}, times={}, attrs=0x{:x}",
-            path,
-            stat.size(),
-            file_id,
-            now,
-            fi.file_attributes
-        );
+        self.write_file_info(file_info.as_mut(), &stat);
 
         let file_context = EncryptedFile::new(file_id, is_directory);
         debug!(
@@ -320,22 +362,7 @@ impl FileSystemContext for EncryptedContext {
             stat.size()
         );
 
-        // Get current time for file timestamps
-        let now = system_time_to_filetime(SystemTime::now());
-
-        let fi = file_info.as_mut();
-        fi.file_attributes = if is_directory {
-            FILE_ATTRIBUTE_DIRECTORY.0
-        } else {
-            FILE_ATTRIBUTE_NORMAL.0
-        };
-        fi.file_size = stat.size();
-        fi.allocation_size = stat.allocation_size();
-        fi.creation_time = now;
-        fi.last_access_time = now;
-        fi.last_write_time = now;
-        fi.change_time = now;
-        fi.index_number = file_id.as_u64();
+        self.write_file_info(file_info.as_mut(), &stat);
 
         Ok(EncryptedFile::new(file_id, is_directory))
     }
@@ -382,7 +409,7 @@ impl FileSystemContext for EncryptedContext {
         Ok(read_size as u32)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, buffer))]
     fn write(
         &self,
         context: &Self::FileContext,
@@ -405,8 +432,7 @@ impl FileSystemContext for EncryptedContext {
 
         // Update file info
         let stat = vfs.stat(context.file_id())?;
-        file_info.file_size = stat.size();
-        file_info.allocation_size = stat.allocation_size();
+        self.write_file_info(file_info, &stat);
         debug!(
             "write: updated file_info file_id={:?}, size={}",
             context.file_id(),
@@ -447,8 +473,8 @@ impl FileSystemContext for EncryptedContext {
         vfs.resize(context.file_id(), 0)?;
 
         // Update file info
-        file_info.file_size = 0;
-        file_info.allocation_size = 0;
+        let stat = vfs.stat(context.file_id())?;
+        self.write_file_info(file_info, &stat);
 
         Ok(())
     }
@@ -469,13 +495,7 @@ impl FileSystemContext for EncryptedContext {
         if let Some(ctx) = context
             && let Ok(stat) = vfs.stat(ctx.file_id())
         {
-            file_info.file_size = stat.size();
-            file_info.allocation_size = stat.allocation_size();
-            debug!(
-                "flush: updated file_info for file_id={:?}, size={}",
-                ctx.file_id(),
-                stat.size()
-            );
+            self.write_file_info(file_info, &stat);
         }
 
         debug!("flush: success");
@@ -491,22 +511,7 @@ impl FileSystemContext for EncryptedContext {
         let vfs = self.vfs.lock().unwrap();
 
         let stat = vfs.stat(context.file_id())?;
-
-        // Get current time for file timestamps
-        let now = system_time_to_filetime(SystemTime::now());
-
-        file_info.file_attributes = if stat.is_directory() {
-            FILE_ATTRIBUTE_DIRECTORY.0
-        } else {
-            FILE_ATTRIBUTE_NORMAL.0
-        };
-        file_info.file_size = stat.size();
-        file_info.allocation_size = stat.allocation_size();
-        file_info.creation_time = now;
-        file_info.last_access_time = now;
-        file_info.last_write_time = now;
-        file_info.change_time = now;
-        file_info.index_number = context.file_id().as_u64();
+        self.write_file_info(file_info, &stat);
 
         Ok(())
     }
@@ -540,18 +545,89 @@ impl FileSystemContext for EncryptedContext {
         Ok(())
     }
 
+    #[instrument(skip(self, volume_info))]
+    fn get_volume_info(
+        &self,
+        volume_info: &mut winfsp::filesystem::VolumeInfo,
+    ) -> winfsp::Result<()> {
+        const HEAD_ROOM_SIZE: u64 = 500 * 1024 * 1024; // Always report 500MB free for headroom
+        // Set volume information
+        let vfs = self.vfs.lock().unwrap();
+        volume_info.total_size = vfs.total_size() + HEAD_ROOM_SIZE;
+        volume_info.free_size = vfs.free_size() + HEAD_ROOM_SIZE;
+        volume_info.set_volume_label("Shrodinger");
+
+        debug!("get_volume_info: returned volume info");
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    fn set_basic_info(
+        &self,
+        context: &Self::FileContext,
+        file_attributes: u32,
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+        change_time: u64,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        debug!(
+            "set_basic_info: file_id={:?}, attrs=0x{:x}, ct={}, lat={}, lwt={}, cht={}",
+            context.file_id(),
+            file_attributes,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time
+        );
+
+        let mut vfs = self.vfs.lock().unwrap();
+        vfs.set_metadata(context.file_id(), creation_time, last_write_time)?;
+        let stat = vfs.stat(context.file_id())?;
+        self.write_file_info(file_info, &stat);
+
+        debug!(
+            "set_basic_info: success for file_id={:?}",
+            context.file_id()
+        );
+        Ok(())
+    }
+
+    #[instrument(skip(self, _security_descriptor))]
+    fn set_security(
+        &self,
+        _context: &Self::FileContext,
+        _security_information: u32,
+        _security_descriptor: winfsp::filesystem::ModificationDescriptor,
+    ) -> winfsp::Result<()> {
+        // We don't support security descriptors, so just acknowledge the request
+        debug!("set_security: acknowledged (not implemented)");
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     fn rename(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         _file_name: &U16CStr,
-        _new_file_name: &U16CStr,
-        _replace_if_exists: bool,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
     ) -> winfsp::Result<()> {
-        // Rename not yet implemented - would need VFS support
-        Err(FspError::NTSTATUS(
-            windows::Win32::Foundation::STATUS_NOT_IMPLEMENTED.0,
-        ))
+        let path = new_file_name.to_string_lossy();
+        debug!("rename: file_id={:?}, new_name={}", context.file_id(), path);
+        let mut vfs = self.vfs.lock().unwrap();
+        if let Ok(old_file_id) = vfs.resolve(&path)
+            && replace_if_exists
+        {
+            vfs.delete(old_file_id)?;
+        }
+
+        let (parent_path, name) = split_parent(&path);
+        let parent_id = vfs.resolve(parent_path)?;
+        vfs.rename(context.file_id(), Some(parent_id), name)?;
+
+        Ok(())
     }
 
     #[instrument(skip(self, buffer))]
@@ -602,14 +678,7 @@ impl FileSystemContext for EncryptedContext {
                 let filename_wide: Vec<u16> = name.encode_utf16().collect();
                 dir_info.set_name_raw(widestring::U16Str::from_slice(&filename_wide))?;
 
-                let fi = dir_info.file_info_mut();
-                fi.file_attributes = if stat.is_directory() {
-                    FILE_ATTRIBUTE_DIRECTORY.0
-                } else {
-                    FILE_ATTRIBUTE_NORMAL.0
-                };
-                fi.file_size = stat.size();
-                fi.allocation_size = stat.allocation_size();
+                self.write_file_info(dir_info.file_info_mut(), &stat);
 
                 dirbuffer.write(&mut dir_info)?;
             }
@@ -622,5 +691,33 @@ impl FileSystemContext for EncryptedContext {
             context.file_id()
         );
         Ok(bytes_read)
+    }
+
+    /// Set the file or allocation size.
+    fn set_file_size(
+        &self,
+        context: &Self::FileContext,
+        new_size: u64,
+        set_allocation_size: bool,
+        _file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        if set_allocation_size {
+            return Ok(());
+        }
+
+        let mut vfs = self.vfs.lock().unwrap();
+        vfs.resize(context.file_id(), new_size)?;
+
+        Ok(())
+    }
+
+    /// Get information about named streams.
+    #[instrument(skip(self, _context, _buffer))]
+    fn get_stream_info(
+        &self,
+        _context: &Self::FileContext,
+        _buffer: &mut [u8],
+    ) -> winfsp::Result<u32> {
+        Ok(0)
     }
 }

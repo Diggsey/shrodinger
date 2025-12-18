@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::btree_map::Entry;
+use std::time::SystemTime;
 use std::{collections::BTreeMap, ops::Range};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -7,6 +8,19 @@ use thiserror::Error;
 
 use crate::block::{BLOCK_DATA_SIZE, BLOCK_SIZE, BlockDeviceError, EncryptedBlockDevice};
 use crate::range::{RangeSet, SortedRangeSet};
+
+fn now() -> u64 {
+    const UNIX_EPOCH_TO_FILETIME_EPOCH: u64 = 116444736000000000; // 100-nanosecond intervals from 1601 to 1970
+
+    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => {
+            let intervals =
+                duration.as_secs() * 10_000_000 + u64::from(duration.subsec_nanos()) / 100;
+            UNIX_EPOCH_TO_FILETIME_EPOCH + intervals
+        }
+        Err(_) => 0, // Before Unix epoch
+    }
+}
 
 pub struct Vfs {
     device: EncryptedBlockDevice,
@@ -156,6 +170,8 @@ struct ItemMetadata {
     blocks: RangeSet,
     // For directories
     children: BTreeMap<String, FileId>,
+    creation_time: u64,
+    last_modified_time: u64,
 }
 
 impl ItemMetadata {
@@ -166,7 +182,12 @@ impl ItemMetadata {
             blocks: RangeSet::default(),
             children: BTreeMap::new(),
             parent_id,
+            creation_time: now(),
+            last_modified_time: now(),
         }
+    }
+    fn mark_modified(&mut self) {
+        self.last_modified_time = now();
     }
 }
 
@@ -175,6 +196,8 @@ pub struct StatItem {
     flags: u32,
     size: u64,
     allocation_size: u64,
+    creation_time: u64,
+    last_modified_time: u64,
 }
 
 impl StatItem {
@@ -189,6 +212,12 @@ impl StatItem {
     }
     pub fn allocation_size(&self) -> u64 {
         self.allocation_size
+    }
+    pub fn creation_time(&self) -> u64 {
+        self.creation_time
+    }
+    pub fn last_modified_time(&self) -> u64 {
+        self.last_modified_time
     }
 }
 
@@ -222,8 +251,6 @@ fn write_metadata(device: &mut EncryptedBlockDevice, value: &VfsMetadata) -> Res
         });
     }
 
-    dbg!("Metadata: {:?}", value);
-
     device.write(0, &buffer)?;
     Ok(())
 }
@@ -240,6 +267,12 @@ impl Vfs {
         }
 
         Ok(vfs)
+    }
+    pub fn total_size(&self) -> u64 {
+        self.metadata.allocated_blocks * BLOCK_DATA_SIZE as u64
+    }
+    pub fn free_size(&self) -> u64 {
+        self.metadata.free_ranges.length() * BLOCK_DATA_SIZE as u64
     }
     pub fn save_metadata(&mut self) -> Result<(), VfsError> {
         loop {
@@ -307,10 +340,17 @@ impl Vfs {
                 flags: item.flags,
                 size: item.size,
                 allocation_size: item.blocks.length() * BLOCK_SIZE,
+                creation_time: item.creation_time,
+                last_modified_time: item.last_modified_time,
             })
             .ok_or(VfsError::NotFound)
     }
-    pub fn create(&mut self, parent_id: FileId, name: &str, flags: u32) -> Result<(), VfsError> {
+    pub fn create(
+        &mut self,
+        parent_id: FileId,
+        name: &str,
+        is_directory: bool,
+    ) -> Result<(), VfsError> {
         let file_id = self.metadata.allocate_file_id();
         let parent_item = self
             .metadata
@@ -325,9 +365,13 @@ impl Vfs {
                 return Err(VfsError::FileExists);
             }
         }
-        self.metadata
-            .items
-            .insert(file_id, ItemMetadata::new(Some(parent_id), flags));
+        self.metadata.items.insert(
+            file_id,
+            ItemMetadata::new(
+                Some(parent_id),
+                if is_directory { ITEM_FLAG_DIRECTORY } else { 0 },
+            ),
+        );
         self.save_metadata()?;
         Ok(())
     }
@@ -412,6 +456,11 @@ impl Vfs {
             .items
             .get_mut(&file_id)
             .ok_or(VfsError::NotFound)?;
+
+        if item.size == new_size {
+            return Ok(());
+        }
+
         let current_blocks = item.blocks.length();
         let required_blocks =
             new_size.next_multiple_of(BLOCK_DATA_SIZE as u64) / BLOCK_DATA_SIZE as u64;
@@ -437,6 +486,7 @@ impl Vfs {
         // Always update size, even if blocks didn't change
         let item = self.metadata.items.get_mut(&file_id).expect("File exists");
         item.size = new_size;
+        item.mark_modified();
 
         self.save_metadata()?;
         Ok(())
@@ -445,13 +495,15 @@ impl Vfs {
         let item = self
             .metadata
             .items
-            .get(&file_id)
+            .get_mut(&file_id)
             .ok_or(VfsError::NotFound)?;
         let required_size = offset + (data.len() as u64);
         if required_size > item.size {
             self.resize(file_id, required_size)?;
             return self.write(file_id, offset, data);
         }
+
+        item.mark_modified();
 
         let mut buffer_offset = 0;
         let mut current_offset = offset;
@@ -477,6 +529,89 @@ impl Vfs {
                 current_offset -= range_len;
             }
         }
+        Ok(())
+    }
+
+    pub fn rename(
+        &mut self,
+        file_id: FileId,
+        new_parent_id: Option<FileId>,
+        new_name: &str,
+    ) -> Result<(), VfsError> {
+        let item = self
+            .metadata
+            .items
+            .get(&file_id)
+            .ok_or(VfsError::NotFound)?;
+
+        // Remove from old parent
+        let old_parent_id = item.parent_id.ok_or(VfsError::NotFound)?;
+        let new_parent_id = new_parent_id.unwrap_or(old_parent_id);
+
+        // Add to new parent
+        let new_parent_item = self
+            .metadata
+            .items
+            .get_mut(&new_parent_id)
+            .ok_or(VfsError::NotFound)?;
+        if let Some(existing_id) = new_parent_item.children.get(new_name) {
+            if existing_id == &file_id {
+                // Renaming to same name in same directory; no-op
+                return Ok(());
+            }
+            return Err(VfsError::FileExists);
+        }
+
+        // Remove from old parent
+        self.metadata
+            .items
+            .get_mut(&old_parent_id)
+            .ok_or(VfsError::NotFound)?
+            .children
+            .retain(|_, &mut id| id != file_id);
+
+        // Insert into new parent
+        let new_parent_item = self
+            .metadata
+            .items
+            .get_mut(&new_parent_id)
+            .ok_or(VfsError::NotFound)?;
+        new_parent_item
+            .children
+            .insert(new_name.to_string(), file_id);
+
+        // Update item's parent ID
+        let item = self
+            .metadata
+            .items
+            .get_mut(&file_id)
+            .ok_or(VfsError::NotFound)?;
+        item.parent_id = Some(new_parent_id);
+
+        self.save_metadata()?;
+        Ok(())
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        file_id: FileId,
+        creation_time: u64,
+        last_modified_time: u64,
+    ) -> Result<(), VfsError> {
+        let item = self
+            .metadata
+            .items
+            .get_mut(&file_id)
+            .ok_or(VfsError::NotFound)?;
+
+        if creation_time != 0 {
+            item.creation_time = creation_time;
+        }
+        if last_modified_time != 0 {
+            item.last_modified_time = last_modified_time;
+        }
+
+        self.save_metadata()?;
         Ok(())
     }
 }
@@ -520,7 +655,7 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         // Create a file in root
-        vfs.create(FileId::ROOT, "test.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "test.txt", false).unwrap();
 
         // File should exist with size 0
         let file_id = vfs.resolve("\\test.txt").unwrap();
@@ -534,8 +669,7 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         // Create a directory in root
-        vfs.create(FileId::ROOT, "mydir", ITEM_FLAG_DIRECTORY)
-            .unwrap();
+        vfs.create(FileId::ROOT, "mydir", true).unwrap();
 
         // Directory should exist
         let dir_id = vfs.resolve("\\mydir").unwrap();
@@ -548,10 +682,10 @@ mod tests {
     fn test_create_duplicate() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "test.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "test.txt", false).unwrap();
 
         // Creating duplicate should fail
-        let result = vfs.create(FileId::ROOT, "test.txt", 0);
+        let result = vfs.create(FileId::ROOT, "test.txt", false);
         assert!(result.is_err());
     }
 
@@ -559,7 +693,7 @@ mod tests {
     fn test_write_and_read() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write data
@@ -580,7 +714,7 @@ mod tests {
     fn test_write_at_offset() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write initial data
@@ -599,7 +733,7 @@ mod tests {
     fn test_write_extends_file() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write beyond current size
@@ -619,7 +753,7 @@ mod tests {
     fn test_write_large_file() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "large.bin", 0).unwrap();
+        vfs.create(FileId::ROOT, "large.bin", false).unwrap();
         let file_id = vfs.resolve("\\large.bin").unwrap();
 
         // Write data larger than one block
@@ -639,7 +773,7 @@ mod tests {
     fn test_resize_grow() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
         vfs.write(file_id, 0, b"Hi").unwrap();
 
@@ -659,7 +793,7 @@ mod tests {
     fn test_resize_shrink() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
         vfs.write(file_id, 0, b"Hello, World!").unwrap();
 
@@ -679,7 +813,7 @@ mod tests {
     fn test_delete_file() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "temp.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "temp.txt", false).unwrap();
         let file_id = vfs.resolve("\\temp.txt").unwrap();
         vfs.write(file_id, 0, b"data").unwrap();
 
@@ -703,8 +837,7 @@ mod tests {
     fn test_delete_empty_directory() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "emptydir", ITEM_FLAG_DIRECTORY)
-            .unwrap();
+        vfs.create(FileId::ROOT, "emptydir", true).unwrap();
         let dir_id = vfs.resolve("\\emptydir").unwrap();
 
         // Should be able to delete empty directory
@@ -716,10 +849,9 @@ mod tests {
     fn test_delete_nonempty_directory() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "dir", ITEM_FLAG_DIRECTORY)
-            .unwrap();
+        vfs.create(FileId::ROOT, "dir", true).unwrap();
         let dir_id = vfs.resolve("\\dir").unwrap();
-        vfs.create(dir_id, "file.txt", 0).unwrap();
+        vfs.create(dir_id, "file.txt", false).unwrap();
 
         // Should not be able to delete non-empty directory
         let result = vfs.delete(dir_id);
@@ -730,12 +862,11 @@ mod tests {
     fn test_list_dir() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "root", ITEM_FLAG_DIRECTORY)
-            .unwrap();
+        vfs.create(FileId::ROOT, "root", true).unwrap();
         let root_id = vfs.resolve("\\root").unwrap();
-        vfs.create(root_id, "file1.txt", 0).unwrap();
-        vfs.create(root_id, "file2.txt", 0).unwrap();
-        vfs.create(root_id, "subdir", ITEM_FLAG_DIRECTORY).unwrap();
+        vfs.create(root_id, "file1.txt", false).unwrap();
+        vfs.create(root_id, "file2.txt", false).unwrap();
+        vfs.create(root_id, "subdir", true).unwrap();
 
         let mut items: Vec<_> = vfs
             .list(root_id)
@@ -754,12 +885,12 @@ mod tests {
     fn test_list_dir_nested() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "a", ITEM_FLAG_DIRECTORY).unwrap();
+        vfs.create(FileId::ROOT, "a", true).unwrap();
         let a_id = vfs.resolve("\\a").unwrap();
-        vfs.create(a_id, "b", ITEM_FLAG_DIRECTORY).unwrap();
+        vfs.create(a_id, "b", true).unwrap();
         let b_id = vfs.resolve("\\a\\b").unwrap();
-        vfs.create(b_id, "file.txt", 0).unwrap();
-        vfs.create(a_id, "other.txt", 0).unwrap();
+        vfs.create(b_id, "file.txt", false).unwrap();
+        vfs.create(a_id, "other.txt", false).unwrap();
 
         // List directory "a"
         let mut items: Vec<_> = vfs
@@ -786,7 +917,7 @@ mod tests {
     fn test_list_dir_not_directory() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Listing a file should fail
@@ -807,7 +938,7 @@ mod tests {
     fn test_read_out_of_bounds() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
         vfs.write(file_id, 0, b"Hello").unwrap();
 
@@ -841,7 +972,7 @@ mod tests {
         let mut file_ids = Vec::new();
         for i in 0..5 {
             let filename = format!("file{}.txt", i);
-            vfs.create(FileId::ROOT, &filename, 0).unwrap();
+            vfs.create(FileId::ROOT, &filename, false).unwrap();
             let file_id = vfs.resolve(&format!("\\{}", filename)).unwrap();
             file_ids.push(file_id);
 
@@ -874,7 +1005,7 @@ mod tests {
             let device = EncryptedBlockDevice::open(file, "persist").unwrap();
             let mut vfs = Vfs::new(device).unwrap();
 
-            vfs.create(FileId::ROOT, "persistent.txt", 0).unwrap();
+            vfs.create(FileId::ROOT, "persistent.txt", false).unwrap();
             let file_id = vfs.resolve("\\persistent.txt").unwrap();
             vfs.write(file_id, 0, b"Persistent data").unwrap();
         }
@@ -899,7 +1030,7 @@ mod tests {
     fn test_overwrite_data() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
         vfs.write(file_id, 0, b"Original").unwrap();
 
@@ -915,7 +1046,7 @@ mod tests {
     fn test_partial_read() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
         vfs.write(file_id, 0, b"0123456789").unwrap();
 
@@ -929,7 +1060,7 @@ mod tests {
     fn test_fragmented_writes() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write data in fragments
@@ -947,13 +1078,12 @@ mod tests {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
         // Create directory structure
-        vfs.create(FileId::ROOT, "root", ITEM_FLAG_DIRECTORY)
-            .unwrap();
+        vfs.create(FileId::ROOT, "root", true).unwrap();
         let root_id = vfs.resolve("\\root").unwrap();
-        vfs.create(root_id, "subdir1", ITEM_FLAG_DIRECTORY).unwrap();
-        vfs.create(root_id, "subdir2", ITEM_FLAG_DIRECTORY).unwrap();
+        vfs.create(root_id, "subdir1", true).unwrap();
+        vfs.create(root_id, "subdir2", true).unwrap();
         let subdir1_id = vfs.resolve("\\root\\subdir1").unwrap();
-        vfs.create(subdir1_id, "file.txt", 0).unwrap();
+        vfs.create(subdir1_id, "file.txt", false).unwrap();
 
         // Verify structure
         let mut items: Vec<_> = vfs
@@ -979,7 +1109,7 @@ mod tests {
     fn test_resize_to_zero() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
         vfs.write(file_id, 0, b"Some data").unwrap();
 
@@ -994,7 +1124,7 @@ mod tests {
     fn test_empty_write() {
         let (_temp_file, mut vfs) = create_temp_vfs();
 
-        vfs.create(FileId::ROOT, "file.txt", 0).unwrap();
+        vfs.create(FileId::ROOT, "file.txt", false).unwrap();
         let file_id = vfs.resolve("\\file.txt").unwrap();
 
         // Write empty data should succeed but not change size
