@@ -6,6 +6,7 @@ use winfsp::{service::FileSystemServiceBuilder, winfsp_init_or_die};
 
 mod block;
 mod fs;
+mod range;
 mod service;
 mod vfs;
 

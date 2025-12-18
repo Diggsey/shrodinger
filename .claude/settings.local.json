@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir C:UsersdiggsProjectsshrodinger /b)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)"
+    ]
+  }
+}
