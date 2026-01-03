@@ -492,6 +492,10 @@ impl Vfs {
             let remove_blocks = current_blocks - required_blocks;
             let removed_ranges = item.blocks.shrink(remove_blocks);
             for range in removed_ranges {
+                // Clear blocks before adding to free ranges
+                for block_index in range.clone() {
+                    self.device.clear_block(block_index)?;
+                }
                 self.metadata.free_ranges.add(range);
             }
         }
@@ -1286,5 +1290,57 @@ mod tests {
             size_after <= size_before,
             "Total size should not increase after shrinking file"
         );
+    }
+
+    #[test]
+    fn test_resize_shrink_clears_blocks() {
+        let (_temp_file, mut vfs) = create_temp_vfs();
+
+        // Create a file with data
+        let file_id = vfs.create(FileId::ROOT, "shrinkme.bin", false).unwrap();
+        let initial_data = vec![0xAB; BLOCK_DATA_SIZE * 5];
+        vfs.write(file_id, 0, &initial_data).unwrap();
+
+        // Get the allocated blocks before shrinking
+        let item = vfs.metadata.items.get(&file_id).unwrap();
+        let all_blocks: Vec<u64> = item.blocks.ranges.iter().flat_map(|r| r.clone()).collect();
+        assert_eq!(all_blocks.len(), 5, "Should have 5 blocks allocated");
+
+        // Shrink to 2 blocks
+        let new_size = (BLOCK_DATA_SIZE as u64) * 2;
+        vfs.resize(file_id, new_size).unwrap();
+
+        // Get the blocks after shrinking
+        let item = vfs.metadata.items.get(&file_id).unwrap();
+        let remaining_blocks: Vec<u64> = item.blocks.ranges.iter().flat_map(|r| r.clone()).collect();
+        assert_eq!(remaining_blocks.len(), 2, "Should have 2 blocks remaining");
+
+        // Find the blocks that were freed
+        let freed_blocks: Vec<u64> = all_blocks
+            .iter()
+            .filter(|b| !remaining_blocks.contains(b))
+            .copied()
+            .collect();
+        assert_eq!(freed_blocks.len(), 3, "Should have freed 3 blocks");
+
+        // Verify the freed blocks are cleared (cannot be decrypted)
+        for block_index in freed_blocks {
+            let result = vfs.device.read_block(block_index);
+            assert!(
+                matches!(result, Err(BlockDeviceError::DecryptionFailed)),
+                "Freed block {} should be cleared after resize",
+                block_index
+            );
+        }
+
+        // Verify the remaining blocks are still readable
+        for block_index in remaining_blocks {
+            let result = vfs.device.read_block(block_index);
+            assert!(
+                result.is_ok(),
+                "Remaining block {} should still be readable",
+                block_index
+            );
+        }
     }
 }
