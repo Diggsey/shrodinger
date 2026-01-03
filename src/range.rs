@@ -146,6 +146,16 @@ impl SortedRangeSet {
         false
     }
 
+    pub fn remove_range_containing(&mut self, index: u64) -> Option<Range<u64>> {
+        for i in 0..self.ranges.len() {
+            let r = &self.ranges[i];
+            if r.contains(&index) {
+                return Some(self.ranges.remove(i));
+            }
+        }
+        None
+    }
+
     pub fn take(&mut self, mut count: u64) -> (RangeSet, u64) {
         let mut result = RangeSet::default();
         while count > 0 && !self.ranges.is_empty() {

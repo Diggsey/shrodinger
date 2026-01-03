@@ -256,6 +256,22 @@ impl EncryptedBlockDevice {
         Ok(())
     }
 
+    pub fn clear_block(&mut self, block_index: u64) -> Result<(), BlockDeviceError> {
+        let real_block_index = block_index * 2;
+        if real_block_index as i64 >= self.block_count {
+            return Ok(());
+        }
+
+        let block_offset = self.offset + real_block_index * BLOCK_SIZE;
+        self.backing_file
+            .seek(std::io::SeekFrom::Start(block_offset))?;
+
+        let mut data = [0u8; BLOCK_SIZE as usize];
+        OsRng.fill_bytes(&mut data);
+        self.backing_file.write_all(&data)?;
+        Ok(())
+    }
+
     pub fn read(&mut self, position: u64, buf: &mut [u8]) -> Result<(), BlockDeviceError> {
         let mut total_read = 0;
         let mut current_position = position;
@@ -681,5 +697,65 @@ mod tests {
 
         // Should succeed
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_clear_block() {
+        let (_temp_file, mut device) = create_temp_device("test_password");
+
+        // Write a block with known data
+        let data = vec![0x42; BLOCK_DATA_SIZE];
+        device.write_block(0, data.clone()).unwrap();
+
+        // Verify we can read it
+        let read_data = device.read_block(0).unwrap();
+        assert_eq!(read_data, data);
+
+        // Clear the block
+        device.clear_block(0).unwrap();
+
+        // Try to read the cleared block - should fail with decryption error
+        let result = device.read_block(0);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockDeviceError::DecryptionFailed));
+    }
+
+    #[test]
+    fn test_clear_nonexistent_block() {
+        let (_temp_file, mut device) = create_temp_device("test_password");
+
+        // Clearing a block that was never written should succeed (no-op)
+        let result = device.clear_block(100);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_clear_multiple_blocks() {
+        let (_temp_file, mut device) = create_temp_device("test_password");
+
+        // Write multiple blocks
+        for i in 0..5 {
+            let data = vec![i as u8; BLOCK_DATA_SIZE];
+            device.write_block(i, data).unwrap();
+        }
+
+        // Clear blocks 1 and 3
+        device.clear_block(1).unwrap();
+        device.clear_block(3).unwrap();
+
+        // Blocks 0, 2, 4 should still be readable
+        assert_eq!(device.read_block(0).unwrap(), vec![0u8; BLOCK_DATA_SIZE]);
+        assert_eq!(device.read_block(2).unwrap(), vec![2u8; BLOCK_DATA_SIZE]);
+        assert_eq!(device.read_block(4).unwrap(), vec![4u8; BLOCK_DATA_SIZE]);
+
+        // Blocks 1 and 3 should fail to decrypt
+        assert!(matches!(
+            device.read_block(1).unwrap_err(),
+            BlockDeviceError::DecryptionFailed
+        ));
+        assert!(matches!(
+            device.read_block(3).unwrap_err(),
+            BlockDeviceError::DecryptionFailed
+        ));
     }
 }
