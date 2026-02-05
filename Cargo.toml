@@ -51,3 +51,4 @@ winfsp = { version = "0.12", features = [
     "windows-62",
     "handle-util",
 ] }
+winres = "0.1"

@@ -31,7 +31,7 @@ fn prompt_new_passwords() -> anyhow::Result<(String, Option<String>)> {
 
 #[inline]
 pub fn svc_start(args: Args) -> anyhow::Result<EncryptedFilesystem> {
-    let mountpoint = args.mountpoint.unwrap_or_else(|| "S:".into());
+    let mountpoint = args.mountpoint.unwrap_or_else(|| r#"\\.\S:"#.into());
 
     let backing_file = args.backing_file.unwrap_or_else(|| {
         std::env::home_dir()
